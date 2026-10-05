@@ -8,11 +8,11 @@ import {
 } from '@browserless.io/browserless';
 import { Server, createServer } from 'http';
 import { AddressInfo, Socket, connect } from 'net';
-import { once } from 'events';
+import { EventEmitter, once } from 'events';
 import { expect } from 'chai';
-import puppeteer, { Page } from 'puppeteer-core';
+import puppeteer, { Browser, Page } from 'puppeteer-core';
 import sinon from 'sinon';
-import WebSocket from 'ws';
+import WebSocket, { WebSocketServer } from 'ws';
 
 import { ChromiumCDP } from './browsers.cdp.js';
 
@@ -26,6 +26,130 @@ describe('ChromiumCDP launch args', function () {
     if (!installed.includes(ChromiumCDP)) {
       this.skip();
     }
+  });
+
+  describe('ChromiumCDP live viewer', () => {
+    it('creates a viewer URL using the configured external base path', () => {
+      const config = new Config();
+      config.setExternalAddress('https://browser.example/proxy/flowpilot');
+      const instance = new ChromiumCDP({
+        blockAds: false,
+        config,
+        logger: new Logger('browsers.cdp.live-view.spec'),
+        userDataDir: null,
+      });
+
+      const live = instance.makeLiveURL('page-123');
+      const liveURL = new URL(live.liveURL);
+
+      expect(live.liveURLId).to.equal('page-123');
+      expect(liveURL.pathname).to.equal('/proxy/flowpilot/live/');
+      expect(liveURL.searchParams.get('ws')).to.equal(
+        'wss://browser.example/proxy/flowpilot/devtools/page/page-123',
+      );
+
+      const authenticatedLiveURL = new URL(
+        instance.makeLiveURL('page-123', 'secret').liveURL,
+      );
+      expect(authenticatedLiveURL.searchParams.get('ws')).to.equal(
+        'wss://browser.example/proxy/flowpilot/devtools/page/page-123?token=secret',
+      );
+    });
+
+    it('answers Browserless.liveURL for the CDP page session without forwarding it to Chromium', async () => {
+      const upstream = new WebSocketServer({ port: 0, host: '127.0.0.1' });
+      await once(upstream, 'listening');
+      const upstreamPort = (upstream.address() as AddressInfo).port;
+      upstream.on('connection', (browserSocket) => {
+        browserSocket.on('message', (data) => {
+          const request = JSON.parse(data.toString()) as {
+            id: number;
+            method: string;
+          };
+          browserSocket.send(
+            JSON.stringify({
+              id: request.id,
+              result: { sessionId: 'page-session-1' },
+            }),
+          );
+        });
+      });
+
+      const config = new Config();
+      config.setExternalAddress('https://browser.example/prefix');
+      const instance = new ChromiumCDP({
+        blockAds: false,
+        config,
+        logger: new Logger('browsers.cdp.live-view.spec'),
+        userDataDir: null,
+      });
+      const fakeProcess = new EventEmitter();
+      const fakeBrowser = Object.assign(new EventEmitter(), {
+        process: () => fakeProcess,
+        pages: async () => [],
+      });
+      Object.assign(instance, {
+        browser: fakeBrowser as unknown as Browser,
+        browserWSEndpoint: `ws://127.0.0.1:${upstreamPort}`,
+      });
+
+      const server = createServer();
+      let proxying: Promise<void> | undefined;
+      server.on('upgrade', (req, socket, head) => {
+        const request = req as import('@browserless.io/browserless').Request;
+        request.parsed = new URL(req.url!, 'http://localhost');
+        proxying = instance.proxyWebSocket(request, socket, head);
+      });
+
+      try {
+        await new Promise<void>((resolve) =>
+          server.listen(0, '127.0.0.1', resolve),
+        );
+        const port = (server.address() as AddressInfo).port;
+        const client = new WebSocket(
+          `ws://127.0.0.1:${port}/chrome?token=live-view-token`,
+        );
+        await once(client, 'open');
+        const attachResponse = once(client, 'message');
+        client.send(
+          JSON.stringify({
+            id: 1,
+            method: 'Target.attachToTarget',
+            params: { targetId: 'page-456', flatten: true },
+          }),
+        );
+        await attachResponse;
+
+        const liveResponse = once(client, 'message');
+        client.send(
+          JSON.stringify({
+            id: 2,
+            method: 'Browserless.liveURL',
+            sessionId: 'page-session-1',
+          }),
+        );
+        const [message] = await liveResponse;
+        const payload = JSON.parse(message.toString()) as {
+          id: number;
+          result: { liveURL: string; liveURLId: string };
+        };
+        const liveURL = new URL(payload.result.liveURL);
+
+        expect(payload.id).to.equal(2);
+        expect(payload.result.liveURLId).to.equal('page-456');
+        expect(liveURL.pathname).to.equal('/prefix/live/');
+        expect(liveURL.searchParams.get('ws')).to.equal(
+          'wss://browser.example/prefix/devtools/page/page-456?token=live-view-token',
+        );
+        const clientClosed = once(client, 'close');
+        client.close(1000);
+        await clientClosed;
+        await proxying;
+      } finally {
+        await new Promise<void>((resolve) => upstream.close(() => resolve()));
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      }
+    });
   });
 
   afterEach(async () => {

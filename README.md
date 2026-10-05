@@ -132,6 +132,18 @@ await browser.close();
 Example Domain
 ```
 
+### Open a live browser view
+
+For Chromium/Chrome CDP sessions, create a temporary interactive viewer URL from a page CDP session:
+
+```js
+const cdp = await page.context().newCDPSession(page);
+const { liveURL } = await cdp.send('Browserless.liveURL');
+console.log(liveURL);
+```
+
+Open the returned URL to view and control that page while the automation session remains active. The link grants access to the page; share it only with trusted users. When the browser connection is authenticated, its token is carried to the viewer's page WebSocket so deployments enforcing `STRICT_TOKEN_USE` continue to authorize access. Playwright's native `/playwright` endpoints do not support this CDP command.
+
 ## ✨ Features
 
 ### General Features

@@ -8,15 +8,18 @@ import {
   chromeExecutablePath,
   edgeExecutablePath,
   findBlockedNavigationUrl,
+  getTokenFromRequest,
   noop,
   once,
   toBlockedUrlPatterns,
   toBlockedUrlRules,
   ublockLitePath,
 } from '@browserless.io/browserless';
+import { type RawData, WebSocket, WebSocketServer } from 'ws';
 import puppeteer, { Browser, CDPSession, Page, Target } from 'puppeteer-core';
 import { Duplex } from 'stream';
 import { EventEmitter } from 'events';
+import { type IncomingMessage } from 'http';
 import StealthPlugin from '@zorilla/puppeteer-extra-plugin-stealth';
 import { addExtra } from '@zorilla/puppeteer-extra';
 import getPort from 'get-port';
@@ -33,6 +36,15 @@ const puppeteerStealth = addExtra(
 puppeteerStealth.use(
   StealthPlugin() as unknown as Parameters<typeof puppeteerStealth.use>[0],
 );
+
+const LIVE_URL_METHOD = 'Browserless.liveURL';
+
+const rawDataToString = (data: RawData): string => {
+  if (typeof data === 'string') return data;
+  if (Array.isArray(data)) return Buffer.concat(data).toString();
+  if (data instanceof ArrayBuffer) return Buffer.from(data).toString();
+  return data.toString();
+};
 
 /**
  * Chrome's component updater fetches into scratch directories under
@@ -60,6 +72,7 @@ puppeteerStealth.use(
 export const disableComponentUpdaterArg = '--disable-component-update';
 
 export class ChromiumCDP extends EventEmitter {
+  private static wsServer = new WebSocketServer({ noServer: true });
   protected config: Config;
   protected userDataDir: string | null;
   protected blockAds: boolean;
@@ -495,6 +508,25 @@ export class ChromiumCDP extends EventEmitter {
     return externalURL.href;
   }
 
+  public makeLiveURL(
+    pageId: string,
+    token?: string | null,
+  ): { liveURL: string; liveURLId: string } {
+    const liveURL = new URL(this.config.getExternalAddress());
+    liveURL.pathname = path.join(liveURL.pathname, '/live/');
+
+    const websocketURL = new URL(this.config.getExternalWebSocketAddress());
+    websocketURL.pathname = path.join(
+      websocketURL.pathname,
+      '/devtools/page/',
+      pageId,
+    );
+    if (token) websocketURL.searchParams.set('token', token);
+    liveURL.searchParams.set('ws', websocketURL.href);
+
+    return { liveURL: liveURL.href, liveURLId: pageId };
+  }
+
   public async proxyPageWebSocket(
     req: Request,
     socket: Duplex,
@@ -620,20 +652,246 @@ export class ChromiumCDP extends EventEmitter {
       // Delete headers known to cause issues
       delete req.headers.origin;
 
-      this.proxy.ws(
-        req,
+      ChromiumCDP.wsServer.handleUpgrade(
+        req as unknown as IncomingMessage,
         socket,
         head,
-        {
-          changeOrigin: true,
-          target: this.browserWSEndpoint,
-        },
-        (error) => {
-          this.logger.error(
-            `Error proxying session to ${this.constructor.name}: ${error}`,
-          );
-          this.close();
-          return reject(error);
+        (client) => {
+          let upstream: WebSocket;
+          try {
+            upstream = new WebSocket(this.browserWSEndpoint!);
+          } catch (error) {
+            client.close(1011, 'Could not connect to browser');
+            reject(error);
+            return;
+          }
+
+          const attachRequests = new Map<number, string>();
+          const targetBySession = new Map<string, string>();
+          const pending: { data: RawData; binary: boolean }[] = [];
+          let upstreamReady = false;
+          let finished = false;
+
+          const finish = (error?: Error) => {
+            if (finished) return;
+            finished = true;
+            client.removeAllListeners('message');
+            upstream.removeAllListeners('message');
+            client.removeAllListeners('open');
+            upstream.removeAllListeners('open');
+            client.removeAllListeners('close');
+            upstream.removeAllListeners('close');
+            client.removeAllListeners('error');
+            upstream.removeAllListeners('error');
+            if (client.readyState === WebSocket.OPEN) client.close();
+            if (
+              upstream.readyState === WebSocket.OPEN ||
+              upstream.readyState === WebSocket.CONNECTING
+            ) {
+              upstream.terminate();
+            }
+            socket.destroy();
+            if (error) reject(error);
+            else resolve();
+          };
+
+          const sendToUpstream = (data: RawData, binary: boolean) => {
+            if (upstreamReady && upstream.readyState === WebSocket.OPEN) {
+              upstream.send(data, { binary });
+            } else if (pending.length < 256) {
+              pending.push({ data, binary });
+            } else {
+              finish(
+                new Error(
+                  'Too many WebSocket messages queued before browser connection',
+                ),
+              );
+            }
+          };
+
+          const findPageId = async (
+            sessionId?: string,
+          ): Promise<string | undefined> => {
+            const attachedTarget = sessionId
+              ? targetBySession.get(sessionId)
+              : undefined;
+            if (attachedTarget) return attachedTarget;
+            const pages = await this.browser?.pages();
+            const latestPage = pages?.at(-1);
+            return latestPage ? this.getPageId(latestPage) : undefined;
+          };
+
+          client.on('message', (data, isBinary) => {
+            if (isBinary) {
+              sendToUpstream(data, true);
+              return;
+            }
+
+            let message: Record<string, unknown>;
+            try {
+              message = JSON.parse(rawDataToString(data)) as Record<
+                string,
+                unknown
+              >;
+            } catch {
+              sendToUpstream(data, false);
+              return;
+            }
+
+            if (
+              message.method === 'Target.attachToTarget' &&
+              typeof message.id === 'number' &&
+              typeof (message.params as { targetId?: unknown } | undefined)
+                ?.targetId === 'string'
+            ) {
+              attachRequests.set(
+                message.id,
+                (message.params as { targetId: string }).targetId,
+              );
+            } else if (message.method === 'Target.detachFromTarget') {
+              const sessionId = (
+                message.params as { sessionId?: unknown } | undefined
+              )?.sessionId;
+              if (typeof sessionId === 'string') {
+                targetBySession.delete(sessionId);
+              }
+            }
+
+            if (
+              message.method === LIVE_URL_METHOD &&
+              typeof message.id === 'number'
+            ) {
+              void findPageId(
+                typeof message.sessionId === 'string'
+                  ? message.sessionId
+                  : undefined,
+              )
+                .then((pageId) => {
+                  if (client.readyState !== WebSocket.OPEN) return;
+                  const session =
+                    typeof message.sessionId === 'string'
+                      ? { sessionId: message.sessionId }
+                      : {};
+                  if (!pageId) {
+                    client.send(
+                      JSON.stringify({
+                        id: message.id,
+                        error: {
+                          code: -32000,
+                          message:
+                            'No active browser page is available for a LiveURL',
+                        },
+                        ...session,
+                      }),
+                    );
+                    return;
+                  }
+                  client.send(
+                    JSON.stringify({
+                      id: message.id,
+                      result: this.makeLiveURL(
+                        pageId,
+                        getTokenFromRequest(req),
+                      ),
+                      ...session,
+                    }),
+                  );
+                })
+                .catch((error: unknown) => {
+                  this.logger.error(
+                    `Could not create Browserless LiveURL: ${error}`,
+                  );
+                  if (client.readyState !== WebSocket.OPEN) return;
+                  client.send(
+                    JSON.stringify({
+                      id: message.id,
+                      error: {
+                        code: -32000,
+                        message: 'Could not create a Browserless LiveURL',
+                      },
+                      ...(typeof message.sessionId === 'string' && {
+                        sessionId: message.sessionId,
+                      }),
+                    }),
+                  );
+                });
+              return;
+            }
+
+            sendToUpstream(data, false);
+          });
+
+          upstream.on('open', () => {
+            upstreamReady = true;
+            for (const message of pending) {
+              upstream.send(message.data, { binary: message.binary });
+            }
+            pending.length = 0;
+          });
+
+          upstream.on('message', (data, isBinary) => {
+            if (!isBinary) {
+              try {
+                const message = JSON.parse(rawDataToString(data)) as Record<
+                  string,
+                  unknown
+                >;
+                const params = message.params as
+                  | {
+                      sessionId?: unknown;
+                      targetInfo?: { targetId?: unknown };
+                    }
+                  | undefined;
+                if (
+                  message.method === 'Target.attachedToTarget' &&
+                  typeof params?.sessionId === 'string' &&
+                  typeof params.targetInfo?.targetId === 'string'
+                ) {
+                  targetBySession.set(
+                    params.sessionId,
+                    params.targetInfo.targetId,
+                  );
+                } else if (
+                  message.method === 'Target.detachedFromTarget' &&
+                  typeof params?.sessionId === 'string'
+                ) {
+                  targetBySession.delete(params.sessionId);
+                } else if (
+                  typeof message.id === 'number' &&
+                  typeof (message.result as { sessionId?: unknown } | undefined)
+                    ?.sessionId === 'string'
+                ) {
+                  const targetId = attachRequests.get(message.id);
+                  if (targetId) {
+                    targetBySession.set(
+                      (
+                        message.result as {
+                          sessionId: string;
+                        }
+                      ).sessionId,
+                      targetId,
+                    );
+                    attachRequests.delete(message.id);
+                  }
+                }
+              } catch {
+                // Non-JSON frames belong to the browser protocol and pass through unchanged.
+              }
+            }
+            if (client.readyState === WebSocket.OPEN) {
+              client.send(data, { binary: isBinary });
+            }
+          });
+
+          client.once('close', () => finish());
+          upstream.once('close', () => finish());
+          client.once('error', (error) => finish(error));
+          upstream.once('error', (error) => {
+            this.logger.error(
+              `Error proxying session to ${this.constructor.name}: ${error}`,
+            );
+            finish(error);
+          });
         },
       );
     });
